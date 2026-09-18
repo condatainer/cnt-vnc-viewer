@@ -1,0 +1,192 @@
+Bootstrap: docker
+From: ubuntu:22.04
+
+%labels
+    Author "cnt-vnc-viewer contributors"
+    Description "Apptainer container with XFCE4, TurboVNC, VirtualGL, and audio support for HPC visualization"
+    Version "1.0.0"
+
+%environment
+    export DEBIAN_FRONTEND=noninteractive
+    export LC_ALL=C.UTF-8
+    export LANG=C.UTF-8
+    export PATH=/opt/TurboVNC/bin:/opt/VirtualGL/bin:/usr/local/bin:$PATH
+    export VGL_DISPLAY=egl
+    export TURBOVNC_DIR=/opt/TurboVNC
+    export VIRTUALGL_DIR=/opt/VirtualGL
+
+%post
+    export DEBIAN_FRONTEND=noninteractive
+    export LC_ALL=C.UTF-8
+    export LANG=C.UTF-8
+
+    TURBOVNC_VERSION="3.3.1"
+    VIRTUALGL_VERSION="3.1.5"
+    # Pinned to the exact version cnt-vnc-viewer's web/package.json vendors
+    # (@novnc/novnc) so an A/B comparison isolates cnt-vnc-viewer's own wrapper
+    # code (VncClient.ts hooks, debounce, etc.) as the variable, not a noVNC
+    # version difference - see run-turbovnc-novnc.sh.
+    NOVNC_VERSION="1.7.0"
+
+    echo "==> Updating system packages..."
+    apt-get update -y && apt-get upgrade -y
+
+    echo "==> Installing core dependencies & X11 utilities..."
+    apt-get install -y --no-install-recommends \
+        bash \
+        curl \
+        wget \
+        ca-certificates \
+        gnupg2 \
+        locales \
+        dbus-x11 \
+        xauth \
+        x11-xserver-utils \
+        x11-xkb-utils \
+        xkb-data \
+        libx11-6 \
+        libxext6 \
+        libxtst6 \
+        libxrender1 \
+        libxi6 \
+        libgl1-mesa-dri \
+        libgl1-mesa-glx \
+        libglu1-mesa \
+        mesa-utils \
+        pulseaudio \
+        pulseaudio-utils \
+        pavucontrol \
+        xfce4-pulseaudio-plugin \
+        libpulse0 \
+        libasound2 \
+        alsa-utils \
+        adwaita-icon-theme \
+        elementary-xfce-icon-theme \
+        fonts-dejavu-core \
+        fonts-freefont-ttf \
+        fonts-noto-cjk \
+        fonts-wqy-zenhei \
+        fonts-wqy-microhei
+
+    echo "==> Configuring locales..."
+    locale-gen en_US.UTF-8 zh_CN.UTF-8 ja_JP.UTF-8 ko_KR.UTF-8 || true
+    update-locale LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 || true
+
+    echo "==> Installing XFCE4 Desktop Environment..."
+    apt-get install -y --no-install-recommends \
+        xfce4 \
+        xfce4-terminal \
+        xfce4-session \
+        xfwm4 \
+        xfdesktop4 \
+        xfce4-panel \
+        thunar
+
+    echo "==> Installing Firefox ESR (via Mozilla Team PPA) & multimedia codecs..."
+    apt-get install -y --no-install-recommends software-properties-common
+    add-apt-repository -y ppa:mozillateam/ppa
+
+    cat <<'EOF' > /etc/apt/preferences.d/mozilla-firefox
+Package: *
+Pin: release o=LP-PPA-mozillateam
+Pin-Priority: 1001
+EOF
+
+    apt-get update -y
+    apt-get install -y --no-install-recommends \
+        firefox-esr \
+        ffmpeg
+    ln -sf /usr/bin/firefox-esr /usr/bin/firefox
+
+    apt-get install -y obs-studio
+
+    echo "==> Installing TurboVNC ${TURBOVNC_VERSION}..."
+    TURBOVNC_URL="https://github.com/TurboVNC/turbovnc/releases/download/${TURBOVNC_VERSION}/turbovnc_${TURBOVNC_VERSION}_amd64.deb"
+    wget -qO /tmp/turbovnc.deb "${TURBOVNC_URL}"
+    dpkg -i /tmp/turbovnc.deb || apt-get install -f -y
+    rm -f /tmp/turbovnc.deb
+
+    echo "==> Installing VirtualGL ${VIRTUALGL_VERSION}..."
+    VIRTUALGL_URL="https://github.com/VirtualGL/virtualgl/releases/download/${VIRTUALGL_VERSION}/virtualgl_${VIRTUALGL_VERSION}_amd64.deb"
+    wget -qO /tmp/virtualgl.deb "${VIRTUALGL_URL}"
+    dpkg -i /tmp/virtualgl.deb || apt-get install -f -y
+    rm -f /tmp/virtualgl.deb
+
+    echo "==> Installing noVNC ${NOVNC_VERSION} + websockify (stock reference client, for A/B"
+    echo "    comparison against cnt-vnc-viewer's own client - see run-turbovnc-novnc.sh)"
+    apt-get install -y --no-install-recommends \
+        python3 \
+        python3-numpy \
+        websockify
+    NOVNC_URL="https://github.com/novnc/noVNC/archive/refs/tags/v${NOVNC_VERSION}.tar.gz"
+    wget -qO /tmp/novnc.tar.gz "${NOVNC_URL}"
+    mkdir -p /opt/noVNC
+    tar -xzf /tmp/novnc.tar.gz -C /opt/noVNC --strip-components=1
+    rm -f /tmp/novnc.tar.gz
+
+    echo "==> Configuring TurboVNC for XFCE4 & security permissions..."
+    mkdir -p /etc/opt/TurboVNC
+    cat <<'EOF' > /etc/opt/TurboVNC/turbovncserver-security.conf
+no-remote-connections
+no-httpd
+no-x509
+permitted-security-types = None, VNC, OTP, UnixLogin, Plain
+EOF
+
+    cat <<'EOF' > /opt/TurboVNC/bin/xstartup.turbovnc
+#!/bin/sh
+unset SESSION_MANAGER
+unset DBUS_SESSION_BUS_ADDRESS
+
+# Ensure writable runtime dir for DBus and XFCE in Apptainer
+export XDG_RUNTIME_DIR="/tmp/runtime-${USER:-user}"
+mkdir -p "$XDG_RUNTIME_DIR"
+chmod 700 "$XDG_RUNTIME_DIR"
+
+# Auto-detect PulseAudio server if not explicitly configured
+if [ -z "$PULSE_SERVER" ]; then
+    for s in /tmp/pulse-vnc-*/native; do
+        if [ -S "$s" ]; then
+            export PULSE_SERVER="unix:$s"
+            break
+        fi
+    done
+fi
+if [ -z "$PULSE_SERVER" ]; then
+    if [ -S "/run/user/$(id -u)/pulse/native" ]; then
+        export PULSE_SERVER="unix:/run/user/$(id -u)/pulse/native"
+    elif [ -d "/tmp" ] && ls /tmp/pulse-*/native >/dev/null 2>&1; then
+        export PULSE_SERVER="unix:$(ls /tmp/pulse-*/native 2>/dev/null | head -n1)"
+    fi
+fi
+
+# Disable screensaver and locker
+if command -v xset >/dev/null 2>&1; then
+    xset s off
+    xset -dpms
+fi
+
+# Launch XFCE4 desktop session with DBus
+if command -v dbus-launch >/dev/null 2>&1; then
+    exec dbus-launch --exit-with-session startxfce4
+elif [ -x /usr/bin/startxfce4 ]; then
+    exec /usr/bin/startxfce4
+fi
+
+if [ -x /etc/X11/xinit/xinitrc ]; then
+    exec /etc/X11/xinit/xinitrc
+fi
+
+xsetroot -solid grey
+xterm -geometry 80x24+10+10 -ls -title "$VNCDESKTOP" &
+EOF
+    chmod 755 /opt/TurboVNC/bin/xstartup.turbovnc
+    cp /opt/TurboVNC/bin/xstartup.turbovnc /etc/opt/TurboVNC/xstartup.turbovnc
+
+    echo "==> Cleaning up build caches..."
+    apt-get clean
+    rm -rf /var/lib/apt/lists/*
+
+%runscript
+    exec "$@"
+

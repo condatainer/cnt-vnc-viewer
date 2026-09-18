@@ -2,11 +2,30 @@
 # https://github.com/github/gitignore/blob/main/community/Golang/Go.AllowList.gitignore
 #
 # Binaries for programs and plugins
+cnt-vnc-viewer
 *.exe
 *.exe~
 *.dll
 *.so
 *.dylib
+
+# Container / VM images (Apptainer/Singularity)
+*.sif
+*.sqf
+*.squashfs
+sandbox/
+
+# Local noVNC dev checkout (assets/test/run-novnc.sh binds this over the
+# image's /opt/noVNC for live-editing/A-B testing core noVNC changes -
+# it's an upstream clone, not project source)
+assets/test/novnc-dev/
+
+# Node / Frontend
+node_modules/
+web/node_modules/
+web/dist/
+cmd/server/dist/
+.npm/
 
 # Test binary, built with `go test -c`
 *.test

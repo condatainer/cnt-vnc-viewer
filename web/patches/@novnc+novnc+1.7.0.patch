@@ -1,0 +1,111 @@
+diff --git a/node_modules/@novnc/novnc/core/display.js b/node_modules/@novnc/novnc/core/display.js
+index 4efd6f4..14ac234 100644
+--- a/node_modules/@novnc/novnc/core/display.js
++++ b/node_modules/@novnc/novnc/core/display.js
+@@ -10,10 +10,49 @@ import * as Log from './util/logging.js';
+ import Base64 from "./base64.js";
+ import { toSigned32bit } from './util/int.js';
+ 
++// EXPERIMENT: Chromium >= 149 has a regression where MemoryCache holds
++// strong references to data: URL resources - since a VNC stream
++// continuously generates unique, one-shot data: JPEG URLs, this causes
++// unbounded "Image Cache" / memory growth over a session
++// (https://issues.chromium.org/issues/545977878, novnc/noVNC#2075).
++// Blob + createImageBitmap avoids that retention entirely (it never
++// touches the data:/<img> resource pipeline), but JPEG decode through it
++// has been reported (novnc/noVNC#2075, not independently verified here)
++// as ~8x slower than the data: URI + Image path - a real regression for
++// unaffected browsers/versions if true. So: only pay that cost on
++// browsers actually affected by the Chromium bug, decided once at
++// startup (the UA doesn't change mid-session).
++function detectChromiumMemoryCacheBug() {
++    try {
++        const brands = navigator.userAgentData && navigator.userAgentData.brands;
++        if (brands) {
++            for (const b of brands) {
++                if (/Chromium|Google Chrome|Microsoft Edge/.test(b.brand)) {
++                    return parseInt(b.version, 10) >= 149;
++                }
++            }
++            // Client Hints available but no Chromium-family brand present
++            // (e.g. Firefox, Safari with UA-CH support) - not affected.
++            return false;
++        }
++    } catch (e) {
++        // Fall through to legacy UA parsing below.
++    }
++
++    const m = /Chrom(?:e|ium)\/(\d+)/.exec(navigator.userAgent);
++    return !!m && parseInt(m[1], 10) >= 149;
++}
++
++const USE_IMAGEBITMAP_DECODE = detectChromiumMemoryCacheBug();
++
+ export default class Display {
+     constructor(target) {
+         this._drawCtx = null;
+ 
++        // Exposed so callers (e.g. cnt-vnc-viewer's debug overlay) can
++        // show which decode path was picked, without needing DevTools.
++        this.usingImageBitmapDecode = USE_IMAGEBITMAP_DECODE;
++
+         this._renderQ = [];  // queue drawing actions for in-oder rendering
+         this._flushPromise = null;
+ 
+@@ -367,6 +406,32 @@ export default class Display {
+             return;
+         }
+ 
++        if (USE_IMAGEBITMAP_DECODE) {
++            // Reportedly slower decode (~8x for JPEG, unverified by us),
++            // but avoids the Chromium MemoryCache regression - see
++            // USE_IMAGEBITMAP_DECODE above.
++            // Only reached on browsers/versions actually affected by it.
++            const blob = new Blob([arr], { type: mime });
++            const action = {
++                'type': 'bitmap',
++                'bitmap': null,
++                'x': x,
++                'y': y,
++                'width': width,
++                'height': height
++            };
++
++            createImageBitmap(blob).then((bitmap) => {
++                action.bitmap = bitmap;
++                this._scanRenderQ();
++            }).catch((err) => {
++                Log.Error("createImageBitmap decode failed: " + err);
++            });
++
++            this._renderQPush(action);
++            return;
++        }
++
+         const img = new Image();
+         img.src = "data: " + mime + ";base64," + Base64.encode(arr);
+ 
+@@ -512,6 +577,23 @@ export default class Display {
+                 case 'blit':
+                     this.blitImage(a.x, a.y, a.width, a.height, a.data, 0, true);
+                     break;
++                case 'bitmap':
++                    if (a.bitmap !== null) {
++                        if (a.bitmap.width !== a.width || a.bitmap.height !== a.height) {
++                            Log.Error("Decoded image has incorrect dimensions. Got " +
++                                      a.bitmap.width + "x" + a.bitmap.height + ". Expected " +
++                                      a.width + "x" + a.height + ".");
++                            return;
++                        }
++                        this.drawImage(a.bitmap, a.x, a.y);
++                        a.bitmap.close();
++                    } else {
++                        // Wait for the createImageBitmap() promise in
++                        // imageRect() to resolve and call _scanRenderQ()
++                        // again, to keep things in-order.
++                        ready = false;
++                    }
++                    break;
+                 case 'img':
+                     if (a.img.complete) {
+                         if (a.img.width !== a.width || a.img.height !== a.height) {

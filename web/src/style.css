@@ -1,0 +1,965 @@
+:root {
+  --bg-main: #0a0c10;
+  --bg-surface: #161b22;
+  --bg-overlay: rgba(22, 27, 34, 0.88);
+  --border-color: #30363d;
+  --text-main: #f0f6fc;
+  --text-muted: #8b949e;
+  --accent-color: #2f81f7;
+  --accent-hover: #388bfd;
+  --success-color: #238636;
+  --warning-color: #d29922;
+  --danger-color: #da3633;
+  --font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif, "Apple Color Emoji", "Segoe UI Emoji";
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+  user-select: none;
+}
+
+html, body {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background-color: var(--bg-main);
+  color: var(--text-main);
+  font-family: var(--font-family);
+  font-size: 14px;
+}
+
+/* -------------------------------------------------------------------------
+ * Scrollbars - thin, dark-themed to match the app instead of default browser
+ * chrome. Applied globally rather than per-element, so it covers every
+ * scrollable area (settings modal body, clipboard drawer, viewport when
+ * zoomed past the window) without needing to track them individually.
+ * ------------------------------------------------------------------------- */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-color) transparent;
+}
+
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+*::-webkit-scrollbar-thumb {
+  background-color: var(--border-color);
+  border-radius: 6px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+
+*::-webkit-scrollbar-thumb:hover {
+  background-color: var(--text-muted);
+}
+
+*::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+#app {
+  position: relative;
+  width: 100vw;
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+/* -------------------------------------------------------------------------
+ * Desktop Canvas Viewport
+ * ------------------------------------------------------------------------- */
+.vnc-viewport {
+  position: relative;
+  flex: 1;
+  width: 100%;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: radial-gradient(circle at center, #13171f 0%, #07090c 100%);
+  /* No scale mode actually needs native scrolling here: 'fit'/'down' scale the canvas via CSS
+   * (never overflows), 'remote-resize' is supposed to always match the container exactly, and
+   * 'none' (1:1) uses noVNC's clipViewport, which clips the canvas element itself down to the
+   * container size (panning is the dedicated Pan Mode toggle, not a scrollbar - see
+   * VncClient.setPanMode). A scrollbar here has no legitimate job, only the potential to
+   * transiently appear mid-resize and trigger a resize-observer feedback loop (request resize
+   * -> scrollbar appears -> layout shifts -> another resize request -> ...), which is what was
+   * causing periodic flashing even after debouncing the request rate itself. */
+  overflow: hidden;
+}
+
+.vnc-viewport canvas {
+  display: block;
+  box-shadow: 0 10px 40px rgba(0, 0, 0, 0.6);
+}
+
+/* Pan mode (1:1 scale only) - see VncClient.setPanMode. Grab cursor signals that drag now
+ * pans the clipped viewport instead of being sent to the remote desktop. */
+.vnc-viewport.pan-mode canvas {
+  cursor: grab;
+}
+
+.vnc-viewport.pan-mode canvas:active {
+  cursor: grabbing;
+}
+
+
+/* -------------------------------------------------------------------------
+ * Icon sprite (Material Symbols outline, referenced by id via <use>)
+ * ------------------------------------------------------------------------- */
+.icon {
+  width: 18px;
+  height: 18px;
+  fill: currentColor;
+  flex-shrink: 0;
+  pointer-events: none;
+}
+
+/* Buttons */
+.icon-btn, .action-btn, .key-btn, .drawer-btn {
+  background: transparent;
+  border: 1px solid var(--border-color);
+  color: var(--text-main);
+  border-radius: 6px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.15s ease;
+}
+
+.icon-btn {
+  width: 32px;
+  height: 32px;
+  font-size: 14px;
+}
+
+.icon-btn:hover, .action-btn:hover, .key-btn:hover {
+  background-color: rgba(255, 255, 255, 0.08);
+  border-color: #8b949e;
+}
+
+.icon-btn.active {
+  background-color: rgba(47, 129, 247, 0.2);
+  border-color: var(--accent-color);
+  color: #79c0ff;
+}
+
+.icon-btn.disabled, .icon-btn:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+
+.icon-btn.disabled:hover, .icon-btn:disabled:hover {
+  background-color: transparent;
+  border-color: var(--border-color);
+}
+
+.action-btn {
+  padding: 5px 12px;
+  font-size: 12px;
+  font-weight: 500;
+  gap: 6px;
+  background-color: var(--accent-color);
+  border-color: var(--accent-color);
+}
+
+.action-btn:hover {
+  background-color: var(--accent-hover);
+}
+
+.action-btn.disconnect-mode {
+  background-color: rgba(218, 54, 51, 0.2);
+  border-color: var(--danger-color);
+  color: #ff7b72;
+}
+
+.action-btn.disconnect-mode:hover {
+  background-color: var(--danger-color);
+  color: #fff;
+}
+
+.connect-btn {
+  width: 32px;
+  height: 32px;
+  padding: 0;
+}
+
+/* -------------------------------------------------------------------------
+ * Left Rail Toolbar
+ * ------------------------------------------------------------------------- */
+.rail-body {
+  position: absolute;
+  left: 0;
+  top: 50%;
+  z-index: 100;
+  transform: translateY(-50%);
+  display: flex;
+  align-items: center;
+  transition: transform 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.rail-body.collapsed {
+  transform: translateY(-50%) translateX(-44px);
+}
+
+.rail-body.collapsed .rail-inner {
+  box-shadow: none;
+  visibility: hidden;
+}
+
+.rail-inner {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 6px;
+  background: var(--bg-overlay);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border-radius: 0 10px 10px 0;
+  border: 1px solid var(--border-color);
+  border-left: none;
+  box-shadow: 4px 0 20px rgba(0, 0, 0, 0.35);
+  pointer-events: auto;
+}
+
+.rail-tab {
+  width: 14px;
+  height: 36px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-color);
+  border-left: none;
+  border-radius: 0 6px 6px 0;
+  color: var(--text-muted);
+  cursor: pointer;
+  pointer-events: auto;
+}
+
+.rail-tab .icon {
+  width: 12px;
+  height: 12px;
+}
+
+.rail-tab:hover {
+  color: var(--text-main);
+  background: var(--border-color);
+}
+
+/* -------------------------------------------------------------------------
+ * Extra Keys Bar
+ * ------------------------------------------------------------------------- */
+.extra-keys-bar {
+  position: absolute;
+  top: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 95;
+  background: var(--bg-overlay);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.4);
+}
+
+.extra-keys-inner {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+}
+
+.key-btn {
+  padding: 4px 8px;
+  font-size: 11px;
+  font-family: monospace;
+  background: var(--bg-surface);
+}
+
+.key-btn.combo-btn {
+  background: rgba(210, 153, 34, 0.15);
+  border-color: rgba(210, 153, 34, 0.4);
+  color: #e3b341;
+}
+
+.key-btn.sticky-btn.active {
+  background-color: var(--accent-color);
+  border-color: var(--accent-color);
+  color: #fff;
+}
+
+.key-separator {
+  width: 1px;
+  height: 20px;
+  background-color: var(--border-color);
+}
+
+.f-keys-group {
+  display: flex;
+  gap: 4px;
+}
+
+/* -------------------------------------------------------------------------
+ * Clipboard Drawer
+ * ------------------------------------------------------------------------- */
+.clipboard-drawer {
+  position: absolute;
+  top: 0;
+  right: -340px;
+  width: 320px;
+  height: 100%;
+  z-index: 110;
+  background: var(--bg-surface);
+  border-left: 1px solid var(--border-color);
+  box-shadow: -10px 0 30px rgba(0, 0, 0, 0.5);
+  display: flex;
+  flex-direction: column;
+  transition: right 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.clipboard-drawer.open {
+  right: 0;
+}
+
+.drawer-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--border-color);
+}
+
+.drawer-header-left, .drawer-header-right {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+/* Toggle Switch */
+.toggle-switch {
+  position: relative;
+  display: inline-block;
+  width: 36px;
+  height: 20px;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.toggle-switch input {
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+
+.toggle-slider {
+  position: absolute;
+  cursor: pointer;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background-color: rgba(255, 255, 255, 0.15);
+  border: 1px solid var(--border-color);
+  transition: all 0.2s ease;
+  border-radius: 20px;
+}
+
+.toggle-slider:before {
+  position: absolute;
+  content: "";
+  height: 14px;
+  width: 14px;
+  left: 2px;
+  bottom: 2px;
+  background-color: var(--text-muted);
+  transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+  border-radius: 50%;
+}
+
+.toggle-switch input:checked + .toggle-slider {
+  background-color: rgba(46, 160, 67, 0.3);
+  border-color: #2ea043;
+}
+
+.toggle-switch input:checked + .toggle-slider:before {
+  transform: translateX(16px);
+  background-color: #3fb950;
+  box-shadow: 0 0 6px rgba(63, 185, 80, 0.6);
+}
+
+/* Sync Status Badge */
+.sync-status-badge {
+  font-size: 10px;
+  font-weight: 700;
+  padding: 2px 6px;
+  border-radius: 10px;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+}
+
+.sync-status-badge.active {
+  background: rgba(46, 160, 67, 0.2);
+  color: #3fb950;
+  border: 1px solid rgba(46, 160, 67, 0.4);
+}
+
+.sync-status-badge.paused {
+  background: rgba(139, 148, 158, 0.2);
+  color: #8b949e;
+  border: 1px solid rgba(139, 148, 158, 0.3);
+}
+
+.drawer-body {
+  flex: 1;
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  overflow-y: auto;
+}
+
+.clipboard-textarea {
+  width: 100%;
+  height: 140px;
+  padding: 10px;
+  background: var(--bg-main);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  color: var(--text-main);
+  font-family: monospace;
+  font-size: 12px;
+  resize: vertical;
+  outline: none;
+  user-select: text;
+}
+
+.clipboard-textarea:focus {
+  border-color: var(--accent-color);
+}
+
+.drawer-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.drawer-btn {
+  flex: 1;
+  padding: 6px 12px;
+  font-size: 12px;
+}
+
+.history-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+
+.clipboard-history-box h5 {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.icon-btn-sm {
+  width: 24px;
+  height: 24px;
+}
+
+.icon-btn-sm .icon {
+  width: 14px;
+  height: 14px;
+}
+
+.clipboard-history-list {
+  list-style: none;
+}
+
+.clipboard-history-list li {
+  padding: 8px 10px;
+  background: var(--bg-main);
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  margin-bottom: 6px;
+  font-size: 11px;
+  font-family: monospace;
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.clipboard-history-list li:hover {
+  border-color: var(--accent-color);
+}
+
+/* -------------------------------------------------------------------------
+ * Modals & Dialogs
+ * ------------------------------------------------------------------------- */
+.modal-backdrop {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  z-index: 200;
+  background: rgba(0, 0, 0, 0.65);
+  backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.modal-dialog {
+  width: 440px;
+  max-width: 90vw;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-color);
+  border-radius: 10px;
+  box-shadow: 0 16px 50px rgba(0, 0, 0, 0.7);
+  display: flex;
+  flex-direction: column;
+}
+
+.modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 18px;
+  border-bottom: 1px solid var(--border-color);
+}
+
+.modal-close-btn {
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 4px;
+}
+
+.modal-close-btn:hover {
+  color: var(--text-main);
+}
+
+.modal-body {
+  padding: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  max-height: 70vh;
+  overflow-y: auto;
+}
+
+.auth-error-msg {
+  color: var(--danger-color);
+  font-weight: 600;
+  margin: -8px 0 0;
+}
+
+.auth-status-msg {
+  color: var(--text-muted);
+  margin: -8px 0 0;
+}
+
+.setting-group {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.setting-label {
+  font-weight: 600;
+  font-size: 12px;
+  color: var(--accent-color);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.setting-label-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+}
+
+.setting-label-row .current-resolution-label {
+  font-weight: 400;
+  font-size: 12px;
+  color: var(--text-muted);
+  text-transform: none;
+  letter-spacing: normal;
+}
+
+.setting-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 13px;
+}
+
+.audio-format-row {
+  justify-content: flex-start;
+  gap: 20px;
+}
+
+.audio-format-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.setting-row select, .auth-password-input {
+  background: var(--bg-main);
+  border: 1px solid var(--border-color);
+  color: var(--text-main);
+  border-radius: 6px;
+  padding: 6px 10px;
+  font-size: 13px;
+  outline: none;
+}
+
+.auth-password-input {
+  width: 100%;
+  margin-top: 8px;
+  user-select: text;
+}
+
+.resolution-inputs {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text-muted);
+}
+
+.resolution-inputs input[type="number"] {
+  width: 72px;
+  background: var(--bg-main);
+  border: 1px solid var(--border-color);
+  color: var(--text-main);
+  border-radius: 6px;
+  padding: 6px 8px;
+  font-size: 13px;
+  outline: none;
+  -moz-appearance: textfield;
+  appearance: textfield;
+}
+
+.resolution-inputs input[type="number"]:focus {
+  border-color: var(--accent-color);
+}
+
+.resolution-inputs input[type="number"]::-webkit-outer-spin-button,
+.resolution-inputs input[type="number"]::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+
+.resolution-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.resolution-actions .drawer-btn {
+  flex: none;
+  padding: 5px 10px;
+  font-size: 12px;
+}
+
+.btn-toggle-group {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.btn-toggle-group .key-btn {
+  padding: 5px 10px;
+  font-family: var(--font-family);
+}
+
+.btn-toggle-group .key-btn.active {
+  background-color: var(--accent-color);
+  border-color: var(--accent-color);
+  color: #fff;
+}
+
+.dpi-control {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: 1;
+  max-width: 220px;
+}
+
+.dpi-control input[type="range"] {
+  flex: 1;
+  cursor: pointer;
+}
+
+.dpi-control input[type="number"] {
+  width: 56px;
+  background: var(--bg-main);
+  border: 1px solid var(--border-color);
+  color: var(--text-main);
+  border-radius: 6px;
+  padding: 4px 6px;
+  font-size: 13px;
+  outline: none;
+  -moz-appearance: textfield;
+  appearance: textfield;
+}
+
+.dpi-control input[type="number"]:focus {
+  border-color: var(--accent-color);
+}
+
+.dpi-control input[type="number"]::-webkit-outer-spin-button,
+.dpi-control input[type="number"]::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+
+.dpi-unit {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.auth-password-input:focus {
+  border-color: var(--accent-color);
+}
+
+.slider-wrapper {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: 1;
+  max-width: 180px;
+}
+
+.slider-wrapper input[type="range"] {
+  flex: 1;
+  cursor: pointer;
+}
+
+.telemetry-box {
+  background: var(--bg-main);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.telem-row {
+  display: flex;
+  justify-content: space-between;
+  font-size: 12px;
+}
+
+.modal-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 12px 18px;
+  border-top: 1px solid var(--border-color);
+}
+
+/* -------------------------------------------------------------------------
+ * Soft Virtual Keyboard
+ * ------------------------------------------------------------------------- */
+.soft-keyboard {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  width: 100%;
+  z-index: 105;
+  background: var(--bg-overlay);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border-top: 1px solid var(--border-color);
+  padding: 8px 12px;
+}
+
+.soft-keyboard-inner {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  max-width: 800px;
+  margin: 0 auto;
+}
+
+.soft-keyboard-header {
+  display: flex;
+  justify-content: flex-end;
+  margin-bottom: 2px;
+}
+
+.kb-row {
+  display: flex;
+  gap: 4px;
+  justify-content: center;
+}
+
+.kb-key {
+  height: 36px;
+  min-width: 32px;
+  flex: 0 0 auto;
+  padding: 0 6px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-color);
+  border-radius: 5px;
+  color: var(--text-main);
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.kb-key:active,
+.kb-key.active {
+  background: var(--accent-color);
+}
+
+/* Widths approximate real keyboard proportions (1u = the ~32px a letter/number key already
+   gets) instead of the old flex-grow, which let backspace/enter/shift/space stretch to soak up
+   all of a row's leftover space - comically oversized since they were the only flexed keys. */
+.key-tab {
+  flex-basis: 48px; /* 1.5u */
+}
+
+.key-caps {
+  flex-basis: 56px; /* 1.75u */
+}
+
+.key-backspace {
+  flex-basis: 64px; /* 2u */
+}
+
+.key-enter, .key-shift {
+  flex-basis: 72px; /* 2.25u */
+}
+
+.key-ctrl, .key-alt, .key-super {
+  flex-basis: 40px; /* 1.25u */
+}
+
+.key-space {
+  flex-basis: 200px; /* ~6.25u */
+}
+
+.hidden {
+  display: none !important;
+}
+
+/* -------------------------------------------------------------------------
+ * Debug Overlay (?debug=1) - audio/render/heap diagnostics
+ * ------------------------------------------------------------------------- */
+.debug-overlay {
+  position: absolute;
+  bottom: 10px;
+  right: 10px;
+  z-index: 120;
+  padding: 5px 10px;
+  background: var(--bg-overlay);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  font-family: monospace;
+  font-size: 11px;
+  color: var(--text-muted);
+  pointer-events: none;
+}
+
+.debug-overlay .warn {
+  color: #ff7b72;
+  font-weight: 700;
+}
+
+.toast-host {
+  position: fixed;
+  bottom: 16px;
+  right: 16px;
+  z-index: 200;
+  display: flex;
+  flex-direction: column-reverse;
+  gap: 8px;
+  max-width: min(360px, calc(100vw - 32px));
+  pointer-events: none;
+}
+
+.toast {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  background: var(--bg-overlay);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  border: 1px solid var(--border-color);
+  border-left: 3px solid var(--text-muted);
+  border-radius: 6px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+  color: var(--text-main);
+  font-size: 13px;
+  line-height: 1.4;
+  pointer-events: auto;
+  opacity: 0;
+  transform: translateX(16px);
+  transition: opacity 0.2s ease, transform 0.2s ease;
+}
+
+.toast.toast-visible {
+  opacity: 1;
+  transform: translateX(0);
+}
+
+.toast-error {
+  border-left-color: var(--danger-color);
+}
+
+.toast-warning {
+  border-left-color: var(--warning-color);
+}
+
+.toast-info {
+  border-left-color: var(--accent-color);
+}
+
+.toast-msg {
+  flex: 1;
+  word-break: break-word;
+}
+
+.toast-close-btn {
+  flex-shrink: 0;
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0 2px;
+}
+
+.toast-close-btn:hover {
+  color: var(--text-main);
+}
+

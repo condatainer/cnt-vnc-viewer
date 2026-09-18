@@ -1,0 +1,263 @@
+diff --git a/core/display.js b/core/display.js
+index 4efd6f4..d53dab2 100644
+--- a/core/display.js
++++ b/core/display.js
+@@ -10,13 +10,74 @@ import * as Log from './util/logging.js';
+ import Base64 from "./base64.js";
+ import { toSigned32bit } from './util/int.js';
+ 
++// EXPERIMENT: Chromium >= 149 has a regression where MemoryCache holds
++// strong references to data: URL resources - since a VNC stream
++// continuously generates unique, one-shot data: JPEG URLs, this causes
++// unbounded "Image Cache" / memory growth over a session
++// (https://issues.chromium.org/issues/545977878, novnc/noVNC#2075).
++// Blob + createImageBitmap avoids that retention entirely, but JPEG
++// decode through it has been reported (novnc/noVNC#2075, not
++// independently verified here) as ~8x slower than the data: URI + Image
++// path - a real regression for unaffected browsers/versions if true. So:
++// only pay that cost on browsers actually affected by the Chromium bug,
++// decided once at startup.
++function detectChromiumMemoryCacheBug() {
++    try {
++        const brands = navigator.userAgentData && navigator.userAgentData.brands;
++        if (brands) {
++            for (const b of brands) {
++                if (/Chromium|Google Chrome|Microsoft Edge/.test(b.brand)) {
++                    return parseInt(b.version, 10) >= 149;
++                }
++            }
++            return false;
++        }
++    } catch (e) {
++        // Fall through to legacy UA parsing below.
++    }
++
++    const m = /Chrom(?:e|ium)\/(\d+)/.exec(navigator.userAgent);
++    return !!m && parseInt(m[1], 10) >= 149;
++}
++
++// Manual override for testing: set window.__NOVNC_FORCE_DECODE to
++// 'bitmap' or 'img' before the RFB/Display is constructed to force a
++// path regardless of browser detection - needed to A/B the two paths
++// (e.g. measure decode latency) on the same machine/browser rather than
++// relying on whichever real Chromium version happens to be installed.
++const USE_IMAGEBITMAP_DECODE =
++    (typeof window !== 'undefined' && window.__NOVNC_FORCE_DECODE)
++        ? window.__NOVNC_FORCE_DECODE === 'bitmap'
++        : detectChromiumMemoryCacheBug();
++
+ export default class Display {
+     constructor(target) {
+         this._drawCtx = null;
+ 
++        // Exposed so callers can show which decode path is actually
++        // rendering, without needing DevTools.
++        this.usingImageBitmapDecode = USE_IMAGEBITMAP_DECODE;
++
++        // EXPERIMENT: every rect is decoded via BOTH paths simultaneously
++        // (see imageRect() below) so decode latency can be compared
++        // head-to-head on identical bytes, same session, same system
++        // load - not just "run twice and hope conditions matched" via
++        // window.__NOVNC_FORCE_DECODE. Only one path's result actually
++        // gets drawn (whichever USE_IMAGEBITMAP_DECODE selected); the
++        // other is decoded purely for timing and discarded. Cumulative -
++        // poll and diff for an average, same pattern as maxRenderQ.
++        this.decodeStats = {
++            bitmap: { count: 0, totalMs: 0 },
++            img: { count: 0, totalMs: 0 }
++        };
++
+         this._renderQ = [];  // queue drawing actions for in-oder rendering
+         this._flushPromise = null;
+ 
++        // EXPERIMENT: cumulative debug counters for the on-page stats
++        // overlay (see vnc.html, ?debug=1) - not part of stock noVNC.
++        this.debugStats = { rects: 0, bytes: 0, maxRenderQ: 0 };
++
+         // the full frame buffer (logical canvas) size
+         this._fbWidth = 0;
+         this._fbHeight = 0;
+@@ -367,9 +428,52 @@ export default class Display {
+             return;
+         }
+ 
++        this.debugStats.rects++;
++        this.debugStats.bytes += arr.length;
++
++        // EXPERIMENT: decode via BOTH paths on every rect, so decode
++        // latency is directly comparable on identical bytes under
++        // identical load, instead of "run twice and hope conditions
++        // matched". The USE_IMAGEBITMAP_DECODE-selected path is the real,
++        // ordered render-queue path (unchanged from the non-comparison
++        // version) - the other is a "shadow" decode purely for timing,
++        // never drawn, released as soon as it's measured.
++
++        if (USE_IMAGEBITMAP_DECODE) {
++            // --- active: bitmap path (ordered, drawn) ---
++            const bitmapStart = performance.now();
++            const blob = new Blob([arr], { type: mime });
++            const action = { 'type': 'bitmap', 'bitmap': null, 'x': x, 'y': y, 'width': width, 'height': height };
++            createImageBitmap(blob).then((bitmap) => {
++                this.decodeStats.bitmap.count++;
++                this.decodeStats.bitmap.totalMs += performance.now() - bitmapStart;
++                action.bitmap = bitmap;
++                this._scanRenderQ();
++            }).catch((err) => {
++                Log.Error("createImageBitmap decode failed: " + err);
++            });
++            this._renderQPush(action);
++
++            // --- shadow: img path (timing only, never drawn) ---
++            const imgStart = performance.now();
++            const shadowImg = new Image();
++            shadowImg.addEventListener('load', () => {
++                this.decodeStats.img.count++;
++                this.decodeStats.img.totalMs += performance.now() - imgStart;
++                shadowImg.src = ""; // release, same as the real path does
++            });
++            shadowImg.src = "data: " + mime + ";base64," + Base64.encode(arr);
++            return;
++        }
++
++        // --- active: img path (ordered, drawn) ---
++        const imgStart = performance.now();
+         const img = new Image();
++        img.addEventListener('load', () => {
++            this.decodeStats.img.count++;
++            this.decodeStats.img.totalMs += performance.now() - imgStart;
++        });
+         img.src = "data: " + mime + ";base64," + Base64.encode(arr);
+-
+         this._renderQPush({
+             'type': 'img',
+             'img': img,
+@@ -378,6 +482,17 @@ export default class Display {
+             'width': width,
+             'height': height
+         });
++
++        // --- shadow: bitmap path (timing only, never drawn) ---
++        const bitmapStart = performance.now();
++        const shadowBlob = new Blob([arr], { type: mime });
++        createImageBitmap(shadowBlob).then((bitmap) => {
++            this.decodeStats.bitmap.count++;
++            this.decodeStats.bitmap.totalMs += performance.now() - bitmapStart;
++            bitmap.close();
++        }).catch((err) => {
++            Log.Error("createImageBitmap decode failed: " + err);
++        });
+     }
+ 
+     videoFrame(x, y, width, height, frame) {
+@@ -481,6 +596,9 @@ export default class Display {
+ 
+     _renderQPush(action) {
+         this._renderQ.push(action);
++        if (this._renderQ.length > this.debugStats.maxRenderQ) {
++            this.debugStats.maxRenderQ = this._renderQ.length;
++        }
+         if (this._renderQ.length === 1) {
+             // If this can be rendered immediately it will be, otherwise
+             // the scanner will wait for the relevant event
+@@ -512,6 +630,23 @@ export default class Display {
+                 case 'blit':
+                     this.blitImage(a.x, a.y, a.width, a.height, a.data, 0, true);
+                     break;
++                case 'bitmap':
++                    if (a.bitmap !== null) {
++                        if (a.bitmap.width !== a.width || a.bitmap.height !== a.height) {
++                            Log.Error("Decoded image has incorrect dimensions. Got " +
++                                      a.bitmap.width + "x" + a.bitmap.height + ". Expected " +
++                                      a.width + "x" + a.height + ".");
++                            return;
++                        }
++                        this.drawImage(a.bitmap, a.x, a.y);
++                        a.bitmap.close();
++                    } else {
++                        // Wait for the createImageBitmap() promise in
++                        // imageRect() to resolve and call _scanRenderQ()
++                        // again, to keep things in-order.
++                        ready = false;
++                    }
++                    break;
+                 case 'img':
+                     if (a.img.complete) {
+                         if (a.img.width !== a.width || a.img.height !== a.height) {
+diff --git a/vnc.html b/vnc.html
+index 82cacd5..3b93ecc 100644
+--- a/vnc.html
++++ b/vnc.html
+@@ -94,8 +94,73 @@
+ 
+         // See docs/EMBEDDING.md for a list of possible settings.
+ 
++        // EXPERIMENT: ?decode=bitmap|img forces core/display.js's decode
++        // path regardless of browser auto-detection, for A/B testing
++        // decode latency on the same machine/browser. Must be set before
++        // UI.start() constructs the RFB (and therefore the Display).
++        const forceDecode = new URLSearchParams(location.search).get('decode');
++        if (forceDecode === 'bitmap' || forceDecode === 'img') {
++            window.__NOVNC_FORCE_DECODE = forceDecode;
++        }
++
+         UI.start({ settings: { defaults: defaults,
+                                mandatory: mandatory } });
++
++        // EXPERIMENT: debug stats overlay, matching cnt-vnc-viewer's
++        // ?debug=1 overlay (rects/s, jpeg KB/s, render queue depth, JS
++        // heap), for direct A/B comparison. Not part of stock noVNC.
++        if (new URLSearchParams(location.search).get('debug') === '1') {
++            const overlay = document.createElement('div');
++            overlay.style.cssText =
++                'position:fixed;top:4px;left:4px;z-index:99999;' +
++                'background:rgba(0,0,0,0.75);color:#0f0;' +
++                'font:12px monospace;padding:6px 10px;border-radius:4px;' +
++                'white-space:pre;pointer-events:none;';
++            document.body.appendChild(overlay);
++
++            let lastRects = 0, lastBytes = 0, lastT = performance.now();
++            let lastBitmapCount = 0, lastBitmapMs = 0;
++            let lastImgCount = 0, lastImgMs = 0;
++
++            const windowAvg = (count, ms, lastCount, lastMs) => {
++                const n = count - lastCount;
++                return n > 0 ? ((ms - lastMs) / n).toFixed(2) : '-';
++            };
++
++            setInterval(() => {
++                const rfb = UI.rfb;
++                if (!rfb || !rfb._display) return;
++                const d = rfb._display;
++                const now = performance.now();
++                const dt = (now - lastT) / 1000;
++                const rects = d.debugStats.rects;
++                const bytes = d.debugStats.bytes;
++                const rectsPerSec = dt > 0 ? Math.round((rects - lastRects) / dt) : 0;
++                const kbPerSec = dt > 0 ? Math.round((bytes - lastBytes) / dt / 1024) : 0;
++                lastRects = rects;
++                lastBytes = bytes;
++                lastT = now;
++
++                const bc = d.decodeStats.bitmap.count, bm = d.decodeStats.bitmap.totalMs;
++                const ic = d.decodeStats.img.count, im = d.decodeStats.img.totalMs;
++                const avgBitmapMs = windowAvg(bc, bm, lastBitmapCount, lastBitmapMs);
++                const avgImgMs = windowAvg(ic, im, lastImgCount, lastImgMs);
++                lastBitmapCount = bc; lastBitmapMs = bm;
++                lastImgCount = ic; lastImgMs = im;
++
++                const heap = performance.memory
++                    ? Math.round(performance.memory.usedJSHeapSize / 1024 / 1024) + 'MB'
++                    : 'n/a';
++
++                overlay.textContent =
++                    `render: ${d.width}x${d.height}\n` +
++                    `rects/s: ${rectsPerSec}  jpeg: ${kbPerSec}KB/s\n` +
++                    `renderQ: ${d._renderQ.length}  max: ${d.debugStats.maxRenderQ}\n` +
++                    `active: ${d.usingImageBitmapDecode ? 'bitmap' : 'img'}\n` +
++                    `decode bitmap: ${avgBitmapMs}ms  img: ${avgImgMs}ms\n` +
++                    `heap: ${heap}`;
++            }, 1000);
++        }
+     </script>
+ </head>
+ 

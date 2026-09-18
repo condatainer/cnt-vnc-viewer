@@ -1,0 +1,130 @@
+name: Build static (musl)
+
+# Builds fully static Linux binaries (musl libc, no glibc, no dynamic
+# libopus dependency) for amd64 and arm64. CGO is required (pkg/audio/opus.go
+# binds to libopus), so each architecture is built natively - inside an
+# Alpine (musl) container running on a matching native runner - rather than
+# cross-compiled, avoiding the need for a cross CGO toolchain.
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  OPUS_VERSION: "1.5.2"
+  GO_IMAGE: "golang:1.27-alpine"
+
+jobs:
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Build frontend
+        working-directory: web
+        run: |
+          npm ci
+          npm run build
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist
+          path: cmd/server/dist/
+          retention-days: 1
+
+  build:
+    needs: frontend
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runs-on: ubuntu-latest
+          - arch: arm64
+            runs-on: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runs-on }}
+    container:
+      image: ${{ env.GO_IMAGE }}
+    env:
+      CGO_ENABLED: "1"
+      GOARCH: ${{ matrix.arch }}
+    steps:
+      - name: Install build dependencies
+        run: apk add --no-cache build-base git curl file
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # need tag history for `git describe`
+
+      - name: Resolve version
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          echo "VERSION=$(git describe --tags --always --dirty)" >> "$GITHUB_ENV"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: frontend-dist
+          path: cmd/server/dist
+
+      # Alpine's opus-dev package only ships libopus.so, not the .a needed
+      # for a fully static binary - build it from source instead.
+      - name: Build static libopus
+        run: |
+          curl -fsSL "https://downloads.xiph.org/releases/opus/opus-${OPUS_VERSION}.tar.gz" -o opus.tar.gz
+          tar xzf opus.tar.gz
+          cd "opus-${OPUS_VERSION}"
+          ./configure --enable-static --disable-shared --prefix=/usr/local
+          make -j"$(nproc)"
+          make install
+
+      - name: Build static binary
+        env:
+          CGO_CFLAGS: "-I/usr/local/include"
+          CGO_LDFLAGS: "-L/usr/local/lib"
+        run: |
+          OUT="cnt-vnc-viewer-linux-musl-${{ matrix.arch }}"
+          go build \
+            -ldflags "-X github.com/condatainer/cnt-vnc-viewer/pkg/version.Version=${VERSION} -linkmode external -extldflags -static" \
+            -o "$OUT" ./cmd/server
+          file "$OUT"
+          # A truly static binary has no dynamic section at all.
+          ldd "$OUT" 2>&1 | grep -q "not a dynamic executable" || {
+            echo "::error::binary is not statically linked"; exit 1;
+          }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cnt-vnc-viewer-linux-musl-${{ matrix.arch }}
+          path: cnt-vnc-viewer-linux-musl-${{ matrix.arch }}
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: cnt-vnc-viewer-linux-musl-*
+          merge-multiple: true
+          path: dist
+
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum cnt-vnc-viewer-linux-musl-* > SHA256SUMS
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/cnt-vnc-viewer-linux-musl-amd64
+            dist/cnt-vnc-viewer-linux-musl-arm64
+            dist/SHA256SUMS
