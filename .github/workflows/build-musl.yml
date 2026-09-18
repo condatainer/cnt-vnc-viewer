@@ -8,15 +8,10 @@ name: Build static (musl)
 
 on:
   push:
-    branches: [main]
     tags: ["v*"]
-  pull_request:
-    branches: [main]
-  workflow_dispatch:
 
 env:
   OPUS_VERSION: "1.5.2"
-  GO_IMAGE: "golang:1.27-alpine"
 
 jobs:
   frontend:
@@ -51,54 +46,52 @@ jobs:
           - arch: arm64
             runs-on: ubuntu-24.04-arm
     runs-on: ${{ matrix.runs-on }}
-    container:
-      image: ${{ env.GO_IMAGE }}
-    env:
-      CGO_ENABLED: "1"
-      GOARCH: ${{ matrix.arch }}
+    # No job-level `container:` - JS actions (checkout, artifacts) are not
+    # supported in Alpine containers on arm64 runners. They run on the host
+    # instead, and only the build itself runs inside Alpine via `docker run`.
     steps:
-      - name: Install build dependencies
-        run: apk add --no-cache build-base git curl file
-
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0 # need tag history for `git describe`
 
       - name: Resolve version
-        run: |
-          git config --global --add safe.directory "$GITHUB_WORKSPACE"
-          echo "VERSION=$(git describe --tags --always --dirty)" >> "$GITHUB_ENV"
+        run: echo "VERSION=$(git describe --tags --always --dirty)" >> "$GITHUB_ENV"
 
       - uses: actions/download-artifact@v4
         with:
           name: frontend-dist
           path: cmd/server/dist
 
+      # Runs natively on the runner's arch, so the image pulled matches it.
       # Alpine's opus-dev package only ships libopus.so, not the .a needed
-      # for a fully static binary - build it from source instead.
-      - name: Build static libopus
-        run: |
-          curl -fsSL "https://downloads.xiph.org/releases/opus/opus-${OPUS_VERSION}.tar.gz" -o opus.tar.gz
-          tar xzf opus.tar.gz
-          cd "opus-${OPUS_VERSION}"
-          ./configure --enable-static --disable-shared --prefix=/usr/local
-          make -j"$(nproc)"
-          make install
-
-      - name: Build static binary
-        env:
-          CGO_CFLAGS: "-I/usr/local/include"
-          CGO_LDFLAGS: "-L/usr/local/lib"
+      # for a fully static binary - build libopus from source instead.
+      - name: Build static binary (Alpine/musl)
         run: |
           OUT="cnt-vnc-viewer-linux-musl-${{ matrix.arch }}"
-          go build \
-            -ldflags "-X github.com/condatainer/cnt-vnc-viewer/pkg/version.Version=${VERSION} -linkmode external -extldflags -static" \
-            -o "$OUT" ./cmd/server
-          file "$OUT"
-          # A truly static binary has no dynamic section at all.
-          ldd "$OUT" 2>&1 | grep -q "not a dynamic executable" || {
-            echo "::error::binary is not statically linked"; exit 1;
-          }
+          docker run --rm \
+            -v "$PWD:/src" -w /src \
+            -e OPUS_VERSION -e VERSION -e OUT="$OUT" \
+            -e CGO_ENABLED=1 -e GOARCH="${{ matrix.arch }}" \
+            -e CGO_CFLAGS="-I/usr/local/include" \
+            -e CGO_LDFLAGS="-L/usr/local/lib" \
+            golang:1.27-alpine sh -eu -c '
+              apk add --no-cache build-base curl file binutils
+              curl -fsSL "https://downloads.xiph.org/releases/opus/opus-${OPUS_VERSION}.tar.gz" -o /tmp/opus.tar.gz
+              tar xzf /tmp/opus.tar.gz -C /tmp
+              cd "/tmp/opus-${OPUS_VERSION}"
+              ./configure --enable-static --disable-shared --prefix=/usr/local
+              make -j"$(nproc)"
+              make install
+              cd /src
+              go build -buildvcs=false \
+                -ldflags "-X github.com/condatainer/cnt-vnc-viewer/pkg/version.Version=${VERSION} -linkmode external -extldflags -static" \
+                -o "$OUT" ./cmd/server
+              file "$OUT"
+              # A truly static binary has no dynamic section at all.
+              if readelf -d "$OUT" 2>/dev/null | grep -q NEEDED; then
+                echo "::error::binary is not statically linked"; exit 1
+              fi
+            '
 
       - uses: actions/upload-artifact@v4
         with:
